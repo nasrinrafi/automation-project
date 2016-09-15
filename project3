@@ -1,0 +1,106 @@
+
+
+4 import itertools
+5 import os
+6 import sqlite3
+7 import time
+8 import tweepy
+9 import twit_utils
+10
+
+11
+
+12 def DownloadUser(download_dir, user):
+13   users_file, follows_file, statuses_file = [
+14       file(os.path.join(download_dir, '%s.%s.json' % (user.screen_name, part)), 'w')
+15       for part in [ 'users', 'follows', 'statuses' ] ]
+16   def WriteEdge(follower, followed):
+17     twit_utils.WriteCompactJson(follows_file,
+18       { 'follower_id': follower.id, 'follower_screen_name': follower.screen_name,
+19         'followed_id': followed.id, 'followed_screen_name': followed.screen_name })
+20   def WriteUser():
+21     twit_utils.WriteCompactJson(
+22         users_file,
+23         twit_utils.ApiCall('get_user', screen_name=user.screen_name)())
+24   followers = twit_utils.Consumer(
+25       twit_utils.UserIter('followers', screen_name=user.screen_name, count=200),
+26       lambda follower: WriteEdge(twit_utils.UserFromJson(follower), user))
+27   friends = twit_utils.Consumer(
+28       twit_utils.UserIter('friends', screen_name=user.screen_name, count=200),
+29       lambda friend: WriteEdge(user, twit_utils.UserFromJson(friend)))
+30   statuses = twit_utils.Consumer(
+31       twit_utils.StatusIter(
+32           'user_timeline', screen_name=user.screen_name, count=200, include_rts=True),
+33       lambda status: twit_utils.WriteCompactJson(statuses_file, status))
+34   for writer in itertools.chain(
+35       [ WriteUser ],
+36       itertools.repeat(followers, 3),
+37       itertools.repeat(friends, 3),
+38       itertools.repeat(statuses, 16)):
+39     writer()
+40
+
+41
+
+42 def GetNewUsers(conn, idle_time):
+43   def Act(conn):
+44     csr = conn.cursor()
+45     users = [ twit_utils.User(row[0], row[1]) for row in csr.execute(
+46         '''
+47         select user_id, screen_name from tweeters where is_downloaded = 0
+48         ''') ]
+49     conn.commit()
+50     return users
+51   while True:
+52     users = twit_utils.RetryUntilDone(conn, Act)
+53     if users:
+54       break
+55     print 'idle'
+56     time.sleep(idle_time)
+57   return users
+58
+
+59
+
+60 def MarkUserAsDownloaded(conn, user):
+61   def Act(conn):
+62     conn.execute(
+63       '''
+64       update tweeters set is_downloaded = 1 where user_id = ?
+65       ''', [ user.id ])
+66     conn.commit()
+67   twit_utils.RetryUntilDone(conn, Act)
+68
+
+69
+
+70 def Run(conn, download_dir, idle_time):
+71   twit_utils.SetApiConn(conn)
+72   twit_utils.EnsureDirExists(download_dir)
+73   while True:
+74     for user in GetNewUsers(conn, idle_time):
+75       try:
+76         DownloadUser(download_dir, user)
+77         print 'downloaded %s' % user
+78       except tweepy.error.TweepError, err:
+79         if err.response.status == 401:
+80           print 'permission denied for %s' % user
+81         else:
+82           raise
+83       MarkUserAsDownloaded(conn, user)
+84
+
+85
+
+86 def main():
+87   args_parser = twit_utils.NewArgsParser('pick users from the queue and download them as JSON')
+88   args_parser.add_argument('--idle_time', default=30, type=float)
+89   args = args_parser.parse_args()
+90   config, conn = twit_utils.ParseConfigAndConn(args)
+91   Run(conn, config.get('download', 'dir'), args.idle_time)
+92
+
+93
+
+94 if __name__ == "__main__":
+95   exit(main())
